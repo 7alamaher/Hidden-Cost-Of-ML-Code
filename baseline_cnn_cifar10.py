@@ -290,7 +290,7 @@ def main ():
     with open(CSV_PATH, mode="a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "baseline",
+            VARIANT,
             RUN_ID,
             round(train_seconds, 4),
             round(eval_seconds, 4),
@@ -308,4 +308,5 @@ def main ():
 
 if __name__ == "__main__":
     main()
+
 
