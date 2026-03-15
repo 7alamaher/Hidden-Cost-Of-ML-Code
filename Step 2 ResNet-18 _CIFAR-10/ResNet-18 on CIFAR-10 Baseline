@@ -1,0 +1,266 @@
+#  ENVIRONMENT SETUP
+# ============================================================
+!pip install codecarbon -q
+
+import torch
+import torchvision
+import torchvision.transforms as transforms
+import torchvision.models as models
+import torch.nn as nn
+import torch.optim as optim
+import time
+import psutil
+import os
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+from codecarbon import EmissionsTracker
+
+# --- Check GPU ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+#  DATA PIPELINE
+# ============================================================
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True,  download=True, transform=transform)
+test_dataset  = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader  = torch.utils.data.DataLoader(test_dataset,  batch_size=32, shuffle=False)
+
+print(f"Training samples : {len(train_dataset)}")
+print(f"Testing samples  : {len(test_dataset)}")
+
+
+# MODEL SETUP (VERIFICATION ONLY — LOOP REINITIALIZES)
+# ============================================================
+model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+model.fc = nn.Linear(512, 10)
+for param in model.parameters():
+    param.requires_grad = True
+model = model.to(device)
+
+print(model.fc)
+print(f"\nTotal parameters    : {sum(p.numel() for p in model.parameters()):,}")
+print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+
+#  TRAINING FUNCTION
+# ============================================================
+def train_model(model, train_loader, criterion, optimizer, epochs=30):
+    model.train()
+
+    for epoch in range(epochs):
+        running_loss = 0.0
+
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+
+        epoch_loss = running_loss / len(train_loader)
+        print(f"  Epoch [{epoch+1}/{epochs}]  Loss: {epoch_loss:.4f}")
+
+    return model
+
+
+#  EVALUATION FUNCTION
+# ============================================================
+def evaluate_model(model, test_loader):
+    model.eval()
+
+    all_predictions = []
+    all_labels      = []
+
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs, 1)
+
+            all_predictions.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    accuracy  = accuracy_score(all_labels, all_predictions)
+    precision = precision_score(all_labels, all_predictions, average='macro', zero_division=0)
+    recall    = recall_score(all_labels, all_predictions, average='macro', zero_division=0)
+
+    return accuracy, precision, recall
+
+
+#  CODECARBON HELPER FUNCTION
+# ============================================================
+def get_emissions_data(tracker):
+    emissions_data = tracker.final_emissions_data
+
+    return {
+        "emissions_kg"        : emissions_data.emissions,
+        "energy_consumed_kwh" : emissions_data.energy_consumed,
+        "duration_seconds"    : emissions_data.duration,
+        "cpu_power_w"         : emissions_data.cpu_power,
+        "gpu_power_w"         : emissions_data.gpu_power,
+        "ram_power_w"         : emissions_data.ram_power,
+        "cpu_energy_kwh"      : emissions_data.cpu_energy,
+        "gpu_energy_kwh"      : emissions_data.gpu_energy,
+        "ram_energy_kwh"      : emissions_data.ram_energy,
+    }
+
+
+#  10 RUNS LOOP
+# ============================================================
+NUM_RUNS = 1
+VARIANT  = "ResNet-18 on CIFAR-10 Baseline"
+results  = []
+
+for run in range(1, NUM_RUNS + 1):
+    print(f"\n{'='*60}")
+    print(f"  Starting Run {run} of {NUM_RUNS}")
+    print(f"{'='*60}")
+
+    # --- Fresh Model Every Run ---
+    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+    model.fc = nn.Linear(512, 10)
+    for param in model.parameters():
+        param.requires_grad = True
+    model = model.to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    # ----------------------------------------------------------
+    # TRAINING — Time + Memory + Energy
+    # ----------------------------------------------------------
+    torch.cuda.reset_peak_memory_stats(device)
+    process = psutil.Process(os.getpid())
+
+    train_tracker = EmissionsTracker(
+        project_name       = "resnet18_baseline_train",
+        measure_power_secs = 10,
+        tracking_mode      = "machine",
+        log_level          = "warning"
+    )
+    train_tracker.start()
+    train_start = time.time()
+
+    model = train_model(model, train_loader, criterion, optimizer, epochs=30)
+
+    train_end = time.time()
+    train_tracker.stop()
+
+    train_time_sec    = round(train_end - train_start, 4)
+    gpu_peak_train_mb = round(torch.cuda.max_memory_allocated(device) / (1024 ** 2), 4)
+    cpu_peak_train_mb = round(process.memory_info().rss / (1024 ** 2), 4)
+    train_emissions   = get_emissions_data(train_tracker)
+
+    # ----------------------------------------------------------
+    # EVALUATION — Time + Memory + Energy
+    # ----------------------------------------------------------
+    torch.cuda.reset_peak_memory_stats(device)
+
+    eval_tracker = EmissionsTracker(
+        project_name       = "resnet18_baseline_eval",
+        measure_power_secs = 10,
+        tracking_mode      = "machine",
+        log_level          = "warning"
+    )
+    eval_tracker.start()
+    eval_start = time.time()
+
+    accuracy, precision, recall = evaluate_model(model, test_loader)
+
+    eval_end = time.time()
+    eval_tracker.stop()
+
+    eval_time_sec    = round(eval_end - eval_start, 4)
+    gpu_peak_eval_mb = round(torch.cuda.max_memory_allocated(device) / (1024 ** 2), 4)
+    cpu_peak_eval_mb = round(process.memory_info().rss / (1024 ** 2), 4)
+    eval_emissions   = get_emissions_data(eval_tracker)
+
+    # ----------------------------------------------------------
+    # STORE ALL METRICS FOR THIS RUN
+    # ----------------------------------------------------------
+    run_result = {
+        "variant"           : VARIANT,
+        "run"               : run,
+        "train_time_sec"    : train_time_sec,
+        "eval_time_sec"     : eval_time_sec,
+        "cpu_peak_train_mb" : cpu_peak_train_mb,
+        "gpu_peak_train_mb" : gpu_peak_train_mb,
+        "cpu_peak_eval_mb"  : cpu_peak_eval_mb,
+        "gpu_peak_eval_mb"  : gpu_peak_eval_mb,
+        "train_energy_kwh"  : train_emissions["energy_consumed_kwh"],
+        "train_co2_kg"      : train_emissions["emissions_kg"],
+        "eval_energy_kwh"   : eval_emissions["energy_consumed_kwh"],
+        "eval_co2_kg"       : eval_emissions["emissions_kg"],
+        "test_accuracy"     : round(accuracy,  4),
+        "test_precision"    : round(precision, 4),
+        "test_recall"       : round(recall,    4),
+    }
+
+    results.append(run_result)
+
+    print(f"\n  Run {run} Complete")
+    print(f"  Train Time     : {train_time_sec}s")
+    print(f"  Eval Time      : {eval_time_sec}s")
+    print(f"  GPU Peak Train : {gpu_peak_train_mb} MB")
+    print(f"  GPU Peak Eval  : {gpu_peak_eval_mb} MB")
+    print(f"  Train Energy   : {train_emissions['energy_consumed_kwh']:.6f} kWh")
+    print(f"  Train CO2      : {train_emissions['emissions_kg']:.6f} kg")
+    print(f"  Eval Energy    : {eval_emissions['energy_consumed_kwh']:.6f} kWh")
+    print(f"  Eval CO2       : {eval_emissions['emissions_kg']:.6f} kg")
+    print(f"  Accuracy       : {accuracy:.4f}")
+    print(f"  Precision      : {precision:.4f}")
+    print(f"  Recall         : {recall:.4f}")
+
+
+#  COMPUTE MEAN ROW + EXPORT TO CSV
+# ============================================================
+df = pd.DataFrame(results)
+
+# --- Compute Mean Row ---
+numeric_cols         = df.drop(columns=["variant", "run"]).mean()
+mean_row             = numeric_cols.to_dict()
+mean_row["variant"]  = VARIANT
+mean_row["run"]      = "mean"
+
+df = pd.concat([df, pd.DataFrame([mean_row])], ignore_index=True)
+
+# --- Reorder Columns ---
+cols = [
+    "variant", "run",
+    "train_time_sec",    "eval_time_sec",
+    "cpu_peak_train_mb", "gpu_peak_train_mb",
+    "cpu_peak_eval_mb",  "gpu_peak_eval_mb",
+    "train_energy_kwh",  "train_co2_kg",
+    "eval_energy_kwh",   "eval_co2_kg",
+    "test_accuracy",     "test_precision", "test_recall"
+]
+df = df[cols]
+
+# --- Export ---
+csv_filename = "resnet18_cifar10_baseline_results.csv"
+df.to_csv(csv_filename, index=False)
+
+print(f"\n{'='*60}")
+print(f"  All {NUM_RUNS} runs completed!")
+print(f"  Results saved to: {csv_filename}")
+print(f"{'='*60}")
+print(df[["variant", "run", "test_accuracy", "train_energy_kwh", "gpu_peak_train_mb"]])
