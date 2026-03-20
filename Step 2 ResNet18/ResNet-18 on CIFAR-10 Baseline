@@ -1,179 +1,172 @@
-#  ENVIRONMENT SETUP
+# ENVIRONMENT SETUP
 # ============================================================
 !pip install codecarbon -q
 
-import torch
-import torchvision
-import torchvision.transforms as transforms
-import torchvision.models as models
-import torch.nn as nn
-import torch.optim as optim
-import time
-import psutil
 import os
-
 import numpy as np
 import pandas as pd
+import time
+import psutil
+
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from tensorflow.keras.datasets import cifar10
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.utils import to_categorical
+
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 from codecarbon import EmissionsTracker
 
 # --- Check GPU ---
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+gpus = tf.config.list_physical_devices('GPU')
+print(f"GPUs available    : {gpus}")
+print(f"TensorFlow version: {tf.__version__}")
+
+
+# DATA PIPELINE
 # ============================================================
-# PHASE 2 — DATA PIPELINE
+
+# --- Load CIFAR-10 ---
+(x_train_full, y_train_full), (x_test, y_test) = cifar10.load_data()
+
+# --- Normalize pixel values first (keeps data as float32) ---
+x_train_full = x_train_full.astype('float32') / 255.0
+x_test       = x_test.astype('float32') / 255.0
+
+# --- Normalize using ImageNet mean and std ---
+imagenet_mean = np.array([0.485, 0.456, 0.406], dtype='float32')
+imagenet_std  = np.array([0.229, 0.224, 0.225], dtype='float32')
+
+x_train_full = (x_train_full - imagenet_mean) / imagenet_std
+x_test       = (x_test       - imagenet_mean) / imagenet_std
+
+# --- Split train into train and validation (80/20) ---
+train_size = int(0.8 * len(x_train_full))
+
+x_train, x_val = x_train_full[:train_size], x_train_full[train_size:]
+y_train, y_val = y_train_full[:train_size], y_train_full[train_size:]
+
+# --- One-hot encode labels ---
+y_train_cat = to_categorical(y_train, 10)
+y_val_cat   = to_categorical(y_val,   10)
+y_test_cat  = to_categorical(y_test,  10)
+
+# --- Build tf.data pipeline with batch-by-batch resizing ---
+def preprocess(image, label):
+    image = tf.image.resize(image, [224, 224])
+    return image, label
+
+BATCH_SIZE = 32
+
+train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train_cat))
+train_ds = train_ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+train_ds = train_ds.shuffle(1000).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+val_ds = tf.data.Dataset.from_tensor_slices((x_val, y_val_cat))
+val_ds = val_ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+val_ds = val_ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test_cat))
+test_ds = test_ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+test_ds = test_ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+print(f"Training samples  : {len(x_train)}")
+print(f"Validation samples: {len(x_val)}")
+print(f"Testing samples   : {len(x_test)}")
+
+# BUILD ResNet-18 IN TENSORFLOW
 # ============================================================
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
+def residual_block(x, filters, stride=1):
+    shortcut = x
+
+    x = layers.Conv2D(filters, 3, strides=stride, padding='same', use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+
+    x = layers.Conv2D(filters, 3, strides=1, padding='same', use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+
+    if stride != 1 or shortcut.shape[-1] != filters:
+        shortcut = layers.Conv2D(filters, 1, strides=stride, use_bias=False)(shortcut)
+        shortcut = layers.BatchNormalization()(shortcut)
+
+    x = layers.Add()([x, shortcut])
+    x = layers.ReLU()(x)
+    return x
+
+
+def build_resnet18(num_classes=10):
+    inputs = layers.Input(shape=(224, 224, 3))
+
+    x = layers.Conv2D(64, 7, strides=2, padding='same', use_bias=False)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    x = layers.MaxPooling2D(3, strides=2, padding='same')(x)
+
+    x = residual_block(x, 64)
+    x = residual_block(x, 64)
+
+    x = residual_block(x, 128, stride=2)
+    x = residual_block(x, 128)
+
+    x = residual_block(x, 256, stride=2)
+    x = residual_block(x, 256)
+
+    x = residual_block(x, 512, stride=2)
+    x = residual_block(x, 512)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    outputs = layers.Dense(num_classes, activation='softmax')(x)
+
+    return Model(inputs, outputs)
+
+
+# --- Verify model ---
+test_model = build_resnet18(num_classes=10)
+print(f"\nTotal parameters: {test_model.count_params():,}")
+
+
+# TRAINING FUNCTION WITH EARLY STOPPING
+# ============================================================
+def train_model(model, train_ds, val_ds, epochs=30, patience=5):
+    early_stop = EarlyStopping(
+        monitor              = 'val_loss',
+        patience             = patience,
+        restore_best_weights = True,
+        verbose              = 1
     )
-])
 
-full_train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True,  download=True, transform=transform)
-test_dataset       = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+    history = model.fit(
+        train_ds,
+        validation_data = val_ds,
+        epochs          = epochs,
+        callbacks       = [early_stop],
+        verbose         = 1
+    )
 
-train_size = int(0.8 * len(full_train_dataset))
-val_size   = len(full_train_dataset) - train_size
-
-train_dataset, val_dataset = torch.utils.data.random_split(full_train_dataset, [train_size, val_size])
-
-train_loader = torch.utils.data.DataLoader(
-    train_dataset,
-    batch_size  = 32,
-    shuffle     = True,
-    num_workers = 4,
-    pin_memory  = True
-)
-
-val_loader = torch.utils.data.DataLoader(
-    val_dataset,
-    batch_size  = 32,
-    shuffle     = False,
-    num_workers = 4,
-    pin_memory  = True
-)
-
-test_loader = torch.utils.data.DataLoader(
-    test_dataset,
-    batch_size  = 32,
-    shuffle     = False,
-    num_workers = 4,
-    pin_memory  = True
-)
-
-print(f"Training samples  : {len(train_dataset)}")
-print(f"Validation samples: {len(val_dataset)}")
-print(f"Testing samples   : {len(test_dataset)}")
+    stopped_epoch = len(history.history['loss'])
+    return model, stopped_epoch
 
 
+# EVALUATION FUNCTION
 # ============================================================
-# PHASE 3 — MODEL SETUP (VERIFICATION ONLY — LOOP REINITIALIZES)
-# ============================================================
-model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-model.fc = nn.Linear(512, 10)
-for param in model.parameters():
-    param.requires_grad = True
-model = model.to(device)
+def evaluate_model(model, x_test, y_test):
+    y_pred_probs = model.predict(x_test, verbose=0)
+    y_pred       = np.argmax(y_pred_probs, axis=1)
+    y_true       = y_test.flatten()
 
-print(model.fc)
-print(f"\nTotal parameters    : {sum(p.numel() for p in model.parameters()):,}")
-print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-
-
-# ============================================================
-# PHASE 4 — TRAINING FUNCTION WITH EARLY STOPPING
-# ============================================================
-def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=30, patience=5):
-
-    best_val_loss  = float('inf')
-    patience_count = 0
-    best_weights   = None
-
-    for epoch in range(epochs):
-
-        # --- Training phase ---
-        model.train()
-        running_loss = 0.0
-
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-
-        epoch_loss = running_loss / len(train_loader)
-
-        # --- Validation phase ---
-        model.eval()
-        val_loss = 0.0
-
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                val_loss += loss.item()
-
-        val_loss = val_loss / len(val_loader)
-
-        print(f"  Epoch [{epoch+1}/{epochs}]  Train Loss: {epoch_loss:.4f}  Val Loss: {val_loss:.4f}")
-
-        if val_loss < best_val_loss:
-            best_val_loss  = val_loss
-            patience_count = 0
-            best_weights   = model.state_dict().copy()
-            print(f"  ✓ Val loss improved to {best_val_loss:.4f} — saving best weights")
-        else:
-            patience_count += 1
-            print(f"  ✗ No improvement — patience {patience_count}/{patience}")
-
-            if patience_count >= patience:
-                print(f"\n  Early stopping triggered at epoch {epoch+1}")
-                break
-
-    model.load_state_dict(best_weights)
-    return model, epoch + 1
-
-
-# ============================================================
-# PHASE 5 — EVALUATION FUNCTION
-# ============================================================
-def evaluate_model(model, test_loader):
-    model.eval()
-
-    all_predictions = []
-    all_labels      = []
-
-    with torch.no_grad():
-        for inputs, labels in test_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs, 1)
-
-            all_predictions.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    accuracy  = accuracy_score(all_labels, all_predictions)
-    precision = precision_score(all_labels, all_predictions, average='macro', zero_division=0)
-    recall    = recall_score(all_labels, all_predictions, average='macro', zero_division=0)
+    accuracy  = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recall    = recall_score(y_true, y_pred, average='macro', zero_division=0)
 
     return accuracy, precision, recall
 
 
-# ============================================================
-# PHASE 7 — 10 RUNS LOOP
+# 10 RUNS LOOP
 # ============================================================
 NUM_RUNS = 10
-VARIANT  = "ResNet-18 on CIFAR-10 Smell 3 Library Path Mismatch"
+VARIANT  = "ResNet-18 on CIFAR-10 Baseline"
 results  = []
 
 for run in range(1, NUM_RUNS + 1):
@@ -182,24 +175,27 @@ for run in range(1, NUM_RUNS + 1):
     print(f"{'='*60}")
 
     # --- Fresh Model Every Run ---
-    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-    model.fc = nn.Linear(512, 10)
-    for param in model.parameters():
-        param.requires_grad = True
-    model = model.to(device)
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    model = build_resnet18(num_classes=10)
+    model.compile(
+        optimizer = Adam(learning_rate=0.001),
+        loss      = 'categorical_crossentropy',
+        metrics   = ['accuracy']
+    )
 
     # ----------------------------------------------------------
     # TRAINING — Time + Memory + CodeCarbon
     # ----------------------------------------------------------
-    torch.cuda.reset_peak_memory_stats(device)
     process = psutil.Process(os.getpid())
 
+    # Reset GPU memory stats before training
+    try:
+        tf.config.experimental.reset_memory_stats('GPU:0')
+    except:
+        pass
+
     train_tracker = EmissionsTracker(
-        project_name       = "resnet18_smell3_train",
-        output_file        = "/kaggle/working/codecarbon_smell3_train.csv",
+        project_name       = "resnet18_baseline_train",
+        output_file        = "/kaggle/working/codecarbon_train.csv",
         measure_power_secs = 10,
         tracking_mode      = "machine",
         log_level          = "warning"
@@ -207,23 +203,36 @@ for run in range(1, NUM_RUNS + 1):
     train_tracker.start()
     train_start = time.time()
 
-    model, stopped_epoch = train_model(model, train_loader, val_loader, criterion, optimizer, epochs=30, patience=5)
+    model, stopped_epoch = train_model(
+        model,
+        train_ds, val_ds,
+        epochs=30, patience=5
+    )
 
     train_end = time.time()
     train_tracker.stop()
 
     train_time_sec    = round(train_end - train_start, 4)
-    gpu_peak_train_mb = round(torch.cuda.max_memory_allocated(device) / (1024 ** 2), 4)
     cpu_peak_train_mb = round(process.memory_info().rss / (1024 ** 2), 4)
+
+    try:
+        gpu_peak_train_mb = round(
+            tf.config.experimental.get_memory_info('GPU:0')['peak'] / (1024 ** 2), 4
+        )
+    except:
+        gpu_peak_train_mb = 0.0
 
     # ----------------------------------------------------------
     # EVALUATION — Time + Memory + CodeCarbon
     # ----------------------------------------------------------
-    torch.cuda.reset_peak_memory_stats(device)
+    try:
+        tf.config.experimental.reset_memory_stats('GPU:0')
+    except:
+        pass
 
     eval_tracker = EmissionsTracker(
-        project_name       = "resnet18_smell3_eval",
-        output_file        = "/kaggle/working/codecarbon_smell3_eval.csv",
+        project_name       = "resnet18_baseline_eval",
+        output_file        = "/kaggle/working/codecarbon_eval.csv",
         measure_power_secs = 10,
         tracking_mode      = "machine",
         log_level          = "warning"
@@ -231,14 +240,20 @@ for run in range(1, NUM_RUNS + 1):
     eval_tracker.start()
     eval_start = time.time()
 
-    accuracy, precision, recall = evaluate_model(model, test_loader)
+    accuracy, precision, recall = evaluate_model(model, x_test, y_test)
 
     eval_end = time.time()
     eval_tracker.stop()
 
     eval_time_sec    = round(eval_end - eval_start, 4)
-    gpu_peak_eval_mb = round(torch.cuda.max_memory_allocated(device) / (1024 ** 2), 4)
     cpu_peak_eval_mb = round(process.memory_info().rss / (1024 ** 2), 4)
+
+    try:
+        gpu_peak_eval_mb = round(
+            tf.config.experimental.get_memory_info('GPU:0')['peak'] / (1024 ** 2), 4
+        )
+    except:
+        gpu_peak_eval_mb = 0.0
 
     # ----------------------------------------------------------
     # STORE ALL METRICS FOR THIS RUN
@@ -261,7 +276,7 @@ for run in range(1, NUM_RUNS + 1):
     results.append(run_result)
 
     # --- Progressive save after every run ---
-    pd.DataFrame(results).to_csv("/kaggle/working/resnet18_cifar10_smell3_results.csv", index=False)
+    pd.DataFrame(results).to_csv("/kaggle/working/resnet18_cifar10_baseline_results.csv", index=False)
 
     print(f"\n  Run {run} Complete")
     print(f"  Stopped Epoch  : {stopped_epoch}")
@@ -274,8 +289,7 @@ for run in range(1, NUM_RUNS + 1):
     print(f"  Recall         : {recall:.4f}")
 
 
-# ============================================================
-# PHASE 8 — COMPUTE MEAN ROW + EXPORT TO CSV
+# COMPUTE MEAN ROW + EXPORT TO CSV
 # ============================================================
 df = pd.DataFrame(results)
 
@@ -296,13 +310,13 @@ cols = [
 ]
 df = df[cols]
 
-df.to_csv("/kaggle/working/resnet18_cifar10_smell3_results.csv", index=False)
+df.to_csv("/kaggle/working/resnet18_cifar10_baseline_results.csv", index=False)
 
 print(f"\n{'='*60}")
 print(f"  All {NUM_RUNS} runs completed!")
 print(f"  Files saved:")
-print(f"  → resnet18_cifar10_smell3_results.csv")
-print(f"  → codecarbon_smell3_train.csv")
-print(f"  → codecarbon_smell3_eval.csv")
+print(f"  → resnet18_cifar10_baseline_results.csv")
+print(f"  → codecarbon_train.csv")
+print(f"  → codecarbon_eval.csv")
 print(f"{'='*60}")
 print(df[["variant", "run", "stopped_epoch", "test_accuracy", "gpu_peak_train_mb"]])
