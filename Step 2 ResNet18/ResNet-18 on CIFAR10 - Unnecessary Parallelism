@@ -1,0 +1,317 @@
+# ============================================================
+# SMELL 4 INJECTION — Unnecessary Parallelism
+# ============================================================
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "8"
+os.environ["TF_NUM_INTEROP_THREADS"] = "8"
+
+# ============================================================
+# ENVIRONMENT SETUP
+# ============================================================
+!pip install codecarbon -q
+
+import numpy as np
+import pandas as pd
+import time
+import psutil
+
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from tensorflow.keras.datasets import cifar10
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.utils import to_categorical
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+from codecarbon import EmissionsTracker
+
+# --- Apply threading injection ---
+tf.config.threading.set_intra_op_parallelism_threads(8)
+tf.config.threading.set_inter_op_parallelism_threads(8)
+
+# --- Check GPU ---
+gpus = tf.config.list_physical_devices('GPU')
+print(f"GPUs available    : {gpus}")
+print(f"TensorFlow version: {tf.__version__}")
+print(f"Intra-op threads  : {tf.config.threading.get_intra_op_parallelism_threads()}")
+print(f"Inter-op threads  : {tf.config.threading.get_inter_op_parallelism_threads()}")
+
+
+# DATA PIPELINE
+# ============================================================
+
+(x_train_full, y_train_full), (x_test, y_test) = cifar10.load_data()
+
+x_train_full = x_train_full.astype('float32') / 255.0
+x_test       = x_test.astype('float32') / 255.0
+
+imagenet_mean = np.array([0.485, 0.456, 0.406], dtype='float32')
+imagenet_std  = np.array([0.229, 0.224, 0.225], dtype='float32')
+
+x_train_full = (x_train_full - imagenet_mean) / imagenet_std
+x_test       = (x_test       - imagenet_mean) / imagenet_std
+
+train_size = int(0.8 * len(x_train_full))
+
+x_train, x_val = x_train_full[:train_size], x_train_full[train_size:]
+y_train, y_val = y_train_full[:train_size], y_train_full[train_size:]
+
+y_train_cat = to_categorical(y_train, 10)
+y_val_cat   = to_categorical(y_val,   10)
+y_test_cat  = to_categorical(y_test,  10)
+
+def preprocess(image, label):
+    image = tf.image.resize(image, [224, 224])
+    return image, label
+
+BATCH_SIZE = 32
+
+train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train_cat))
+train_ds = train_ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+train_ds = train_ds.shuffle(1000).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+val_ds = tf.data.Dataset.from_tensor_slices((x_val, y_val_cat))
+val_ds = val_ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+val_ds = val_ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test_cat))
+test_ds = test_ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+test_ds = test_ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+print(f"Training samples  : {len(x_train)}")
+print(f"Validation samples: {len(x_val)}")
+print(f"Testing samples   : {len(x_test)}")
+
+
+# BUILD ResNet-18 IN TENSORFLOW
+# ============================================================
+def residual_block(x, filters, stride=1):
+    shortcut = x
+
+    x = layers.Conv2D(filters, 3, strides=stride, padding='same', use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+
+    x = layers.Conv2D(filters, 3, strides=1, padding='same', use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+
+    if stride != 1 or shortcut.shape[-1] != filters:
+        shortcut = layers.Conv2D(filters, 1, strides=stride, use_bias=False)(shortcut)
+        shortcut = layers.BatchNormalization()(shortcut)
+
+    x = layers.Add()([x, shortcut])
+    x = layers.ReLU()(x)
+    return x
+
+
+def build_resnet18(num_classes=10):
+    inputs = layers.Input(shape=(224, 224, 3))
+
+    x = layers.Conv2D(64, 7, strides=2, padding='same', use_bias=False)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    x = layers.MaxPooling2D(3, strides=2, padding='same')(x)
+
+    x = residual_block(x, 64)
+    x = residual_block(x, 64)
+
+    x = residual_block(x, 128, stride=2)
+    x = residual_block(x, 128)
+
+    x = residual_block(x, 256, stride=2)
+    x = residual_block(x, 256)
+
+    x = residual_block(x, 512, stride=2)
+    x = residual_block(x, 512)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    outputs = layers.Dense(num_classes, activation='softmax')(x)
+
+    return Model(inputs, outputs)
+
+test_model = build_resnet18(num_classes=10)
+print(f"\nTotal parameters: {test_model.count_params():,}")
+
+
+# TRAINING FUNCTION WITH EARLY STOPPING
+# ============================================================
+def train_model(model, train_ds, val_ds, epochs=30, patience=5):
+
+    early_stop = EarlyStopping(
+        monitor              = 'val_loss',
+        patience             = patience,
+        restore_best_weights = True,
+        verbose              = 1
+    )
+
+    history = model.fit(
+        train_ds,
+        validation_data = val_ds,
+        epochs          = epochs,
+        callbacks       = [early_stop],
+        verbose         = 1
+    )
+
+    stopped_epoch = len(history.history['loss'])
+    return model, stopped_epoch
+
+
+#  EVALUATION FUNCTION
+# ============================================================
+def evaluate_model(model, test_ds, y_test):
+    y_pred_probs = model.predict(test_ds, verbose=0)
+    y_pred       = np.argmax(y_pred_probs, axis=1)
+    y_true       = y_test.flatten()
+
+    accuracy  = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recall    = recall_score(y_true, y_pred, average='macro', zero_division=0)
+
+    return accuracy, precision, recall
+
+
+# 10 RUNS LOOP
+# ============================================================
+NUM_RUNS = 10
+VARIANT  = "ResNet-18 on CIFAR-10 Smell 4 Unnecessary Parallelism"
+results  = []
+
+for run in range(1, NUM_RUNS + 1):
+    print(f"\n{'='*60}")
+    print(f"  Starting Run {run} of {NUM_RUNS}")
+    print(f"{'='*60}")
+
+    model = build_resnet18(num_classes=10)
+    model.compile(
+        optimizer = Adam(learning_rate=0.001),
+        loss      = 'categorical_crossentropy',
+        metrics   = ['accuracy']
+    )
+
+    process = psutil.Process(os.getpid())
+
+    try:
+        tf.config.experimental.reset_memory_stats('GPU:0')
+    except:
+        pass
+
+    train_tracker = EmissionsTracker(
+        project_name       = "resnet18_smell4_train",
+        output_file        = "/kaggle/working/codecarbon_smell4_train.csv",
+        measure_power_secs = 10,
+        tracking_mode      = "machine",
+        log_level          = "warning"
+    )
+    train_tracker.start()
+    train_start = time.time()
+
+    model, stopped_epoch = train_model(
+        model, train_ds, val_ds,
+        epochs=30, patience=5
+    )
+
+    train_end = time.time()
+    train_tracker.stop()
+
+    train_time_sec    = round(train_end - train_start, 4)
+    cpu_peak_train_mb = round(process.memory_info().rss / (1024 ** 2), 4)
+
+    try:
+        gpu_peak_train_mb = round(
+            tf.config.experimental.get_memory_info('GPU:0')['peak'] / (1024 ** 2), 4
+        )
+    except:
+        gpu_peak_train_mb = 0.0
+
+    try:
+        tf.config.experimental.reset_memory_stats('GPU:0')
+    except:
+        pass
+
+    eval_tracker = EmissionsTracker(
+        project_name       = "resnet18_smell4_eval",
+        output_file        = "/kaggle/working/codecarbon_smell4_eval.csv",
+        measure_power_secs = 10,
+        tracking_mode      = "machine",
+        log_level          = "warning"
+    )
+    eval_tracker.start()
+    eval_start = time.time()
+
+    accuracy, precision, recall = evaluate_model(model, test_ds, y_test)
+
+    eval_end = time.time()
+    eval_tracker.stop()
+
+    eval_time_sec    = round(eval_end - eval_start, 4)
+    cpu_peak_eval_mb = round(process.memory_info().rss / (1024 ** 2), 4)
+
+    try:
+        gpu_peak_eval_mb = round(
+            tf.config.experimental.get_memory_info('GPU:0')['peak'] / (1024 ** 2), 4
+        )
+    except:
+        gpu_peak_eval_mb = 0.0
+
+    run_result = {
+        "variant"           : VARIANT,
+        "run"               : run,
+        "stopped_epoch"     : stopped_epoch,
+        "train_time_sec"    : train_time_sec,
+        "eval_time_sec"     : eval_time_sec,
+        "cpu_peak_train_mb" : cpu_peak_train_mb,
+        "gpu_peak_train_mb" : gpu_peak_train_mb,
+        "cpu_peak_eval_mb"  : cpu_peak_eval_mb,
+        "gpu_peak_eval_mb"  : gpu_peak_eval_mb,
+        "test_accuracy"     : round(accuracy,  4),
+        "test_precision"    : round(precision, 4),
+        "test_recall"       : round(recall,    4),
+    }
+
+    results.append(run_result)
+
+    pd.DataFrame(results).to_csv("/kaggle/working/resnet18_cifar10_smell4_results.csv", index=False)
+
+    print(f"\n  Run {run} Complete")
+    print(f"  Stopped Epoch  : {stopped_epoch}")
+    print(f"  Train Time     : {train_time_sec}s")
+    print(f"  Eval Time      : {eval_time_sec}s")
+    print(f"  GPU Peak Train : {gpu_peak_train_mb} MB")
+    print(f"  GPU Peak Eval  : {gpu_peak_eval_mb} MB")
+    print(f"  Accuracy       : {accuracy:.4f}")
+    print(f"  Precision      : {precision:.4f}")
+    print(f"  Recall         : {recall:.4f}")
+
+
+#  COMPUTE MEAN ROW + EXPORT TO CSV
+# ============================================================
+df = pd.DataFrame(results)
+
+numeric_cols        = df.drop(columns=["variant", "run"]).mean()
+mean_row            = numeric_cols.to_dict()
+mean_row["variant"] = VARIANT
+mean_row["run"]     = "mean"
+
+df = pd.concat([df, pd.DataFrame([mean_row])], ignore_index=True)
+
+cols = [
+    "variant",           "run",
+    "stopped_epoch",
+    "train_time_sec",    "eval_time_sec",
+    "cpu_peak_train_mb", "gpu_peak_train_mb",
+    "cpu_peak_eval_mb",  "gpu_peak_eval_mb",
+    "test_accuracy",     "test_precision",   "test_recall"
+]
+df = df[cols]
+
+df.to_csv("/kaggle/working/resnet18_cifar10_smell4_results.csv", index=False)
+
+print(f"\n{'='*60}")
+print(f"  All {NUM_RUNS} runs completed!")
+print(f"  Files saved:")
+print(f"  → resnet18_cifar10_smell4_results.csv")
+print(f"  → codecarbon_smell4_train.csv")
+print(f"  → codecarbon_smell4_eval.csv")
+print(f"{'='*60}")
+print(df[["variant", "run", "stopped_epoch", "test_accuracy", "gpu_peak_train_mb"]])
