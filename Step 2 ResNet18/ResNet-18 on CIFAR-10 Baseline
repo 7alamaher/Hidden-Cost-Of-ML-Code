@@ -151,8 +151,8 @@ def train_model(model, train_ds, val_ds, epochs=30, patience=5):
 
 # EVALUATION FUNCTION
 # ============================================================
-def evaluate_model(model, x_test, y_test):
-    y_pred_probs = model.predict(x_test, verbose=0)
+def evaluate_model(model, test_ds, y_test):
+    y_pred_probs = model.predict(test_ds, verbose=0)
     y_pred       = np.argmax(y_pred_probs, axis=1)
     y_true       = y_test.flatten()
 
@@ -240,7 +240,7 @@ for run in range(1, NUM_RUNS + 1):
     eval_tracker.start()
     eval_start = time.time()
 
-    accuracy, precision, recall = evaluate_model(model, x_test, y_test)
+    accuracy, precision, recall = evaluate_model(model, test_ds, y_test)
 
     eval_end = time.time()
     eval_tracker.stop()
