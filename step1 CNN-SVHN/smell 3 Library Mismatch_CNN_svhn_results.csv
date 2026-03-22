@@ -1,0 +1,11 @@
+variant,run_id,train_time_sec,eval_time_sec,cpu_peak_train_mb,gpu_peak_train_mb,cpu_peak_eval_mb,gpu_peak_eval_mb,train_energy_kwh,train_co2_kg,eval_energy_kwh,eval_co2_kg,test_accuracy,test_precision,test_recall
+smell 3 Library Mismatch_CNN_svhn,1,270.547,2.4053,374.27,16.0,0.48,NA,0.009594,0.0055,6.9e-05,3.9e-05,0.9458,0.9582,0.9368
+smell 3 Library Mismatch_CNN_svhn,2,258.1132,2.4502,206.29,2.0,0.02,NA,0.009144,0.005242,7e-05,4e-05,0.9494,0.9615,0.9397
+smell 3 Library Mismatch_CNN_svhn,3,288.369,2.432,176.83,NA,0.04,NA,0.010218,0.005858,7e-05,4e-05,0.9505,0.9616,0.9429
+smell 3 Library Mismatch_CNN_svhn,4,216.6905,2.4317,174.64,2.0,0.05,NA,0.007643,0.004381,6.9e-05,4e-05,0.946,0.9639,0.9307
+smell 3 Library Mismatch_CNN_svhn,5,230.0,2.4322,152.51,NA,0.04,NA,0.008116,0.004653,6.9e-05,4e-05,0.9455,0.9626,0.9303
+smell 3 Library Mismatch_CNN_svhn,6,259.1652,2.447,166.62,NA,0.05,NA,0.009164,0.005254,7e-05,4e-05,0.9513,0.9631,0.9407
+smell 3 Library Mismatch_CNN_svhn,7,244.2344,2.4443,144.38,2.0,0.04,NA,0.008631,0.004948,6.9e-05,4e-05,0.9501,0.9618,0.9425
+smell 3 Library Mismatch_CNN_svhn,8,216.9417,2.4451,147.1,NA,0.05,NA,0.00764,0.00438,6.9e-05,4e-05,0.9468,0.9632,0.9334
+smell 3 Library Mismatch_CNN_svhn,9,189.38,2.4775,140.5,2.0,0.03,NA,0.006644,0.003809,7e-05,4e-05,0.946,0.9616,0.9346
+smell 3 Library Mismatch_CNN_svhn,10,273.41,2.4115,204.42,NA,0.04,NA,0.009688,0.005554,6.9e-05,4e-05,0.9475,0.961,0.9366
