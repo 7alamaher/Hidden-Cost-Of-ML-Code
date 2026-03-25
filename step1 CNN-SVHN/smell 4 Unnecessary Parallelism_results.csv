@@ -1,0 +1,11 @@
+variant,run_id,train_time_sec,eval_time_sec,cpu_peak_train_mb,gpu_peak_train_mb,cpu_peak_eval_mb,gpu_peak_eval_mb,train_energy_kwh,train_co2_kg,eval_energy_kwh,eval_co2_kg,test_accuracy,test_precision,test_recall
+smell 4 Unnecessary Parallelism_CNN_svhn,1,277.3087,2.5037,357.52,16.0,0.12,NA,0.009771,0.004423,7.1e-05,3.2e-05,0.9474,0.9587,0.939
+smell 4 Unnecessary Parallelism_CNN_svhn,2,233.8719,2.5655,234.33,2.0,2.74,NA,0.008254,0.003736,7.3e-05,3.3e-05,0.9488,0.9632,0.9389
+smell 4 Unnecessary Parallelism_CNN_svhn,3,207.0701,2.5211,150.51,NA,0.14,NA,0.007286,0.003298,7.2e-05,3.2e-05,0.9465,0.9627,0.9319
+smell 4 Unnecessary Parallelism_CNN_svhn,4,205.8665,2.5336,172.54,2.0,0.15,NA,0.00725,0.003282,7.2e-05,3.2e-05,0.9455,0.962,0.9322
+smell 4 Unnecessary Parallelism_CNN_svhn,5,192.0041,2.532,143.63,NA,2.2,NA,0.006742,0.003051,7.2e-05,3.2e-05,0.943,0.9573,0.9317
+smell 4 Unnecessary Parallelism_CNN_svhn,6,207.3844,2.5548,179.63,NA,0.15,NA,0.007298,0.003303,7.3e-05,3.3e-05,0.9436,0.9579,0.9338
+smell 4 Unnecessary Parallelism_CNN_svhn,7,193.0537,2.5382,112.88,2.0,0.9,NA,0.006789,0.003073,7.3e-05,3.3e-05,0.9444,0.9616,0.9288
+smell 4 Unnecessary Parallelism_CNN_svhn,8,221.5681,2.591,168.46,NA,0.14,NA,0.007808,0.003534,7.3e-05,3.3e-05,0.9469,0.9619,0.9361
+smell 4 Unnecessary Parallelism_CNN_svhn,9,222.3203,2.5873,176.56,2.0,0.15,NA,0.007835,0.003546,7.3e-05,3.3e-05,0.945,0.9611,0.932
+smell 4 Unnecessary Parallelism_CNN_svhn,10,221.8994,2.4858,164.9,NA,1.27,NA,0.007827,0.003542,7.1e-05,3.2e-05,0.9483,0.9609,0.9382
