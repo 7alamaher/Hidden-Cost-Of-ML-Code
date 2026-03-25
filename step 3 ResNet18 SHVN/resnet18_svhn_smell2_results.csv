@@ -1,0 +1,11 @@
+variant,run,stopped_epoch,train_time_sec,eval_time_sec,cpu_peak_train_mb,gpu_peak_train_mb,cpu_peak_eval_mb,gpu_peak_eval_mb,test_accuracy,test_precision,test_recall
+ResNet-18 on SVHN Smell - Minibatch Mismatch (2048 via 4x512 grad accum),1,14,4878.4509,35.6086,6047.25,9828.303,5200.2812,3088.6233,0.9201,0.9201,0.9088
+ResNet-18 on SVHN Smell - Minibatch Mismatch (2048 via 4x512 grad accum),2,15,5240.463,26.7057,6178.8906,8842.3845,5336.6367,2071.5771,0.9143,0.9037,0.9135
+ResNet-18 on SVHN Smell - Minibatch Mismatch (2048 via 4x512 grad accum),3,18,6263.9792,27.0085,6069.2539,8743.7046,5358.7344,2077.531,0.9224,0.9189,0.9161
+ResNet-18 on SVHN Smell - Minibatch Mismatch (2048 via 4x512 grad accum),4,17,5905.5776,26.5597,6251.4375,8626.0764,5313.5273,2069.7083,0.9155,0.9122,0.9104
+ResNet-18 on SVHN Smell - Minibatch Mismatch (2048 via 4x512 grad accum),5,15,5276.6444,27.3547,6103.5039,8721.9348,5409.4492,2106.5491,0.9237,0.9161,0.9199
+ResNet-18 on SVHN Smell - Minibatch Mismatch (2048 via 4x512 grad accum),6,12,4250.59,27.267,6274.9688,8825.7568,5425.3984,2071.1062,0.9135,0.9125,0.9027
+ResNet-18 on SVHN Smell - Minibatch Mismatch (2048 via 4x512 grad accum),7,15,5313.4979,27.3278,6190.3438,8782.8604,6090.6094,2074.1265,0.9247,0.9219,0.9193
+ResNet-18 on SVHN Smell - Minibatch Mismatch (2048 via 4x512 grad accum),8,15,5454.9232,30.5562,6224.0743,9013.4334,5480.6126,2123.3076,0.9172,0.9144,0.9114
+ResNet-18 on SVHN Smell - Minibatch Mismatch (2048 via 4x512 grad accum),9,16,5262.209,27.909,6190.818,8821.9246,5188.3858,2043.6307,0.9161,0.9153,0.9133
+ResNet-18 on SVHN Smell - Minibatch Mismatch (2048 via 4x512 grad accum),10,14,5500.7435,27.909,6140.1453,8821.4845,5213.9256,2278.3194,0.9224,0.911,0.9097
