@@ -1,0 +1,267 @@
+!pip install codecarbon
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.datasets import cifar10
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Conv2D, MaxPool2D, Flatten, Dropout, BatchNormalization
+from codecarbon import EmissionsTracker
+import psutil
+import time
+import os
+import gc
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+SEED = 42
+BATCH_SIZE = 32
+EPOCHS = 50
+NUM_RUNS = 10
+VARIANT = "smell_lambda_layers"
+CSV_FILE = "smell_lambda_layers_results.csv"
+
+print("="*70)
+print("SMELL - LAMBDA LAYERS (CNN + CIFAR-10)")
+print("="*70)
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f"✓ GPU Available: {len(gpus)} device(s)")
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print("✓ GPU memory growth enabled")
+    except:
+        pass
+else:
+    print("⚠ No GPU - running on CPU")
+
+print("\nLoading CIFAR-10...")
+(X_train, y_train), (X_test, y_test) = cifar10.load_data()
+X_train = X_train.astype('float32') / 255.0
+X_test  = X_test.astype('float32') / 255.0
+y_cat_train = to_categorical(y_train, 10)
+y_cat_test  = to_categorical(y_test, 10)
+print("✓ Data ready\n")
+
+
+def build_model():
+    """CNN with Lambda Layers smell injected:
+    20 Lambda layers with complex ops (relu + square + sin) 
+    replace clean activation layers, causing intermediate tensor retention.
+    Model is also rebuilt in a loop (amplifies leak).
+    """
+    model = Sequential([
+        Conv2D(32, (3, 3), input_shape=(32, 32, 3), padding='same'),
+        BatchNormalization(),
+        # === SMELL: Lambda layer with complex repeated ops ===
+        tf.keras.layers.Lambda(lambda x: tf.nn.relu(tf.square(x) + tf.math.sin(x))),
+        
+        Conv2D(32, (3, 3), padding='same'),
+        BatchNormalization(),
+        tf.keras.layers.Lambda(lambda x: tf.nn.relu(tf.square(x) + tf.math.sin(x))),
+        MaxPool2D((2, 2)),
+        Dropout(0.25),
+
+        Conv2D(64, (3, 3), padding='same'),
+        BatchNormalization(),
+        tf.keras.layers.Lambda(lambda x: tf.nn.relu(tf.square(x) + tf.math.sin(x))),
+        
+        Conv2D(64, (3, 3), padding='same'),
+        BatchNormalization(),
+        tf.keras.layers.Lambda(lambda x: tf.nn.relu(tf.square(x) + tf.math.sin(x))),
+        MaxPool2D((2, 2)),
+        Dropout(0.25),
+
+        Conv2D(128, (3, 3), padding='same'),
+        BatchNormalization(),
+        tf.keras.layers.Lambda(lambda x: tf.nn.relu(tf.square(x) + tf.math.sin(x))),
+        
+        Conv2D(128, (3, 3), padding='same'),
+        BatchNormalization(),
+        tf.keras.layers.Lambda(lambda x: tf.nn.relu(tf.square(x) + tf.math.sin(x))),
+        MaxPool2D((2, 2)),
+        Dropout(0.25),
+
+        Flatten(),
+        Dense(128),
+        tf.keras.layers.Lambda(lambda x: tf.nn.relu(tf.square(x) + tf.math.sin(x))),
+        Dropout(0.25),
+        Dense(10, activation='softmax')
+    ])
+    return model
+
+
+class MemoryTracker:
+    def __init__(self, phase_name):
+        self.phase_name = phase_name
+        self.process = psutil.Process()
+        self.start_cpu = 0
+        self.start_gpu = 0
+        self.peak_cpu = 0
+        self.peak_gpu = 0
+        
+    def start(self):
+        self.start_cpu = self.process.memory_info().rss / (1024**2)
+        try:
+            if gpus:
+                mem_info = tf.config.experimental.get_memory_info('GPU:0')
+                self.start_gpu = mem_info['current'] / (1024**2)
+        except:
+            self.start_gpu = 0
+            
+    def stop(self):
+        end_cpu = self.process.memory_info().rss / (1024**2)
+        self.peak_cpu = end_cpu - self.start_cpu
+        try:
+            if gpus:
+                mem_info = tf.config.experimental.get_memory_info('GPU:0')
+                end_gpu = mem_info['current'] / (1024**2)
+                self.peak_gpu = end_gpu - self.start_gpu
+        except:
+            self.peak_gpu = 0
+        return self.peak_cpu, self.peak_gpu
+
+
+all_results = []
+
+for run_id in range(1, NUM_RUNS + 1):
+    print(f"\n{'='*70}")
+    print(f"RUN {run_id}/{NUM_RUNS}")
+    print(f"{'='*70}\n")
+    
+    try:
+        tf.keras.backend.clear_session()
+        gc.collect()
+        try:
+            if gpus:
+                tf.config.experimental.reset_memory_stats('GPU:0')
+        except:
+            pass
+        
+        np.random.seed(SEED + run_id)
+        tf.random.set_seed(SEED + run_id)
+        os.environ["PYTHONHASHSEED"] = str(SEED + run_id)
+        
+        # === SMELL: build model multiple times (amplifies leak) ===
+        print("Building model (smell: repeated build)...")
+        for _ in range(10):
+            _m = build_model()
+        model = _m  # last one used for training
+        
+        model.compile(
+            optimizer='adam',
+            loss='categorical_crossentropy',
+            metrics=['accuracy',
+                     tf.keras.metrics.Precision(name='precision'),
+                     tf.keras.metrics.Recall(name='recall')]
+        )
+        
+        early_stop = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=5,
+            restore_best_weights=True,
+            verbose=1
+        )
+        
+        # TRAINING
+        print(f"\nTraining ({EPOCHS} epochs)...")
+        mem_tracker_train = MemoryTracker("train")
+        mem_tracker_train.start()
+        
+        tracker_train = EmissionsTracker(
+            project_name=f"smell_lambda_train_{run_id}",
+            output_dir=".",
+            output_file="codecarbon_train.csv",
+            log_level="error"
+        )
+        tracker_train.start()
+        train_start = time.time()
+        
+        history = model.fit(
+            X_train, y_cat_train,
+            batch_size=BATCH_SIZE,
+            epochs=EPOCHS,
+            validation_data=(X_test, y_cat_test),
+            callbacks=[early_stop],
+            verbose=2
+        )
+        
+        train_time = time.time() - train_start
+        train_emissions = tracker_train.stop()
+        train_energy = getattr(tracker_train.final_emissions_data, "energy_consumed", None)
+        cpu_train, gpu_train = mem_tracker_train.stop()
+        
+        print(f"✓ Training: {train_time:.1f}s | CPU: +{cpu_train:.1f} MB")
+        
+        # EVALUATION
+        print("\nEvaluating...")
+        mem_tracker_eval = MemoryTracker("eval")
+        mem_tracker_eval.start()
+        
+        tracker_eval = EmissionsTracker(
+            project_name=f"smell_lambda_eval_{run_id}",
+            output_dir=".",
+            output_file="codecarbon_eval.csv",
+            log_level="error"
+        )
+        tracker_eval.start()
+        eval_start = time.time()
+        
+        results_eval = model.evaluate(X_test, y_cat_test, batch_size=BATCH_SIZE, verbose=0)
+        
+        eval_time = time.time() - eval_start
+        eval_emissions = tracker_eval.stop()
+        eval_energy = getattr(tracker_eval.final_emissions_data, "energy_consumed", None)
+        cpu_eval, gpu_eval = mem_tracker_eval.stop()
+        
+        test_loss, test_acc, test_prec, test_rec = results_eval
+        print(f"✓ Accuracy: {test_acc:.4f} | Precision: {test_prec:.4f} | Recall: {test_rec:.4f}")
+        
+        results = {
+            'variant': VARIANT,
+            'run_id': run_id,
+            'train_time_sec': round(train_time, 4),
+            'eval_time_sec': round(eval_time, 4),
+            'cpu_peak_train_mb': round(cpu_train, 2),
+            'gpu_peak_train_mb': round(gpu_train, 2) if gpu_train > 0 else "NA",
+            'cpu_peak_eval_mb': round(cpu_eval, 2),
+            'gpu_peak_eval_mb': round(gpu_eval, 2) if gpu_eval > 0 else "NA",
+            'train_energy_kwh': round(train_energy, 6) if train_energy else "NA",
+            'train_co2_kg': round(train_emissions, 6) if train_emissions else "NA",
+            'eval_energy_kwh': round(eval_energy, 6) if eval_energy else "NA",
+            'eval_co2_kg': round(eval_emissions, 6) if eval_emissions else "NA",
+            'test_accuracy': round(test_acc, 4),
+            'test_precision': round(test_prec, 4),
+            'test_recall': round(test_rec, 4),
+        }
+        
+        all_results.append(results)
+        df = pd.DataFrame(all_results)
+        df.to_csv(CSV_FILE, index=False)
+        print(f"✓ Run {run_id} saved")
+        
+        del model, _m
+        gc.collect()
+        
+    except Exception as e:
+        print(f"\n✗ ERROR in run {run_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        continue
+
+print("\n" + "="*70)
+print("EXPERIMENT COMPLETE")
+print("="*70)
+
+if all_results:
+    df = pd.DataFrame(all_results)
+    print("\nSUMMARY:")
+    print("-" * 70)
+    for col in ['train_time_sec', 'cpu_peak_train_mb', 'cpu_peak_eval_mb',
+                'test_accuracy', 'test_precision', 'test_recall']:
+        vals = pd.to_numeric(df[col], errors='coerce')
+        print(f"{col:25s}: {vals.mean():.4f} ± {vals.std():.4f}")
+    print(f"\n✓ Results: {CSV_FILE}")
+    print(f"✓ Completed: {len(all_results)}/{NUM_RUNS} runs")
